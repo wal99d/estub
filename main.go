@@ -1,120 +1,82 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"fmt"
-	"io"
 	"log"
+	"math/rand"
+	"os"
+	"strings"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gliderlabs/ssh"
+	"github.com/gofiber/fiber/v2"
 )
 
-func main() {
-	ssh.Handle(func(sess ssh.Session) {
-		_, _, isTty := sess.Pty()
-		cfg := &container.Config{
-			Image:        sess.User(),
-			Cmd:          sess.Command(),
-			Env:          sess.Environ(),
-			Tty:          isTty,
-			OpenStdin:    true,
-			AttachStderr: true,
-			AttachStdin:  true,
-			AttachStdout: true,
-			StdinOnce:    true,
-			Volumes:      make(map[string]struct{}),
-		}
-		status, cleanup, err := dockerRun(cfg, sess)
-		defer cleanup()
-		if err != nil {
-			fmt.Fprintln(sess, err)
-			log.Println(err)
-		}
-		sess.Exit(int(status))
-	})
+var (
+	Characters = []rune("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+)
 
-	log.Println("starting ssh server on port 2222...")
-	log.Fatal(ssh.ListenAndServe(":2222", nil))
+func generateURI() string {
+	uriString := make([]rune, 10)
+	for i, uri := range uriString {
+		uri = Characters[rand.Intn(len(uriString))]
+		uriString[i] = uri
+	}
+	return string(uriString)
 }
 
-func dockerRun(cfg *container.Config, sess ssh.Session) (status int64, cleanup func(), err error) {
-	docker, err := client.NewEnvClient()
-	if err != nil {
-		panic(err)
-	}
-	status = 255
-	cleanup = func() {}
-	ctx := context.Background()
-	//res, err := docker.ContainerCreate(ctx, cfg, nil, nil, "")
-	res, err := docker.ContainerCreate(ctx, cfg, nil, nil, nil, "")
-	if err != nil {
-		return
-	}
-	cleanup = func() {
-		docker.ContainerRemove(ctx, res.ID, types.ContainerRemoveOptions{})
-	}
-	opts := types.ContainerAttachOptions{
-		Stdin:  cfg.AttachStdin,
-		Stdout: cfg.AttachStdout,
-		Stderr: cfg.AttachStderr,
-		Stream: true,
-	}
-	stream, err := docker.ContainerAttach(ctx, res.ID, opts)
-	if err != nil {
-		return
-	}
-	cleanup = func() {
-		docker.ContainerRemove(ctx, res.ID, types.ContainerRemoveOptions{})
-		stream.Close()
-	}
+func init() {
+	rand.New(rand.NewSource(time.Now().UnixMicro()))
+}
 
-	outputErr := make(chan error)
+func main() {
+	app := fiber.New(fiber.Config{
+		ReadTimeout: 5 * time.Second,
+	})
+	resp := new(bytes.Buffer)
+	done := make(chan struct{})
+	sig := make(chan os.Signal)
+	uri := generateURI()
+	baseUrl := "http://localhost:3000"
 
-	go func() {
-		var err error
-		if cfg.Tty {
-			_, err = io.Copy(sess, stream.Reader)
+	ssh.Handle(func(sess ssh.Session) {
+		resp.ReadFrom(sess)
+		sess.Write([]byte(fmt.Sprintf("%x", "0x0C")))
+		url := fmt.Sprintf("%s/%s", baseUrl, uri)
+		sess.Write([]byte(url))
+		<-done
+		sess.Write([]byte("we are done"))
+		sig <- os.Kill
+	})
+
+	app.Get("/:uri", func(c *fiber.Ctx) error {
+		newUri := c.Params("uri")
+		if strings.EqualFold(uri, newUri) {
+			close(done)
+			return c.SendStream(resp, resp.Len())
 		} else {
-			_, err = stdcopy.StdCopy(sess, sess.Stderr(), stream.Reader)
+			return c.SendString("Nothing to show..")
 		}
-		outputErr <- err
-	}()
-
+	})
 	go func() {
-		defer stream.CloseWrite()
-		io.Copy(stream.Conn, sess)
+		log.Fatal(app.Listen(":3000"))
 	}()
 
-	err = docker.ContainerStart(ctx, res.ID, types.ContainerStartOptions{})
-	if err != nil {
-		return
-	}
-	if cfg.Tty {
-		_, winCh, _ := sess.Pty()
-		go func() {
-			for win := range winCh {
-				err := docker.ContainerResize(ctx, res.ID, types.ResizeOptions{
-					Height: uint(win.Height),
-					Width:  uint(win.Width),
-				})
-				if err != nil {
-					log.Println(err)
-					break
-				}
-			}
-		}()
-	}
-	resultC, errC := docker.ContainerWait(ctx, res.ID, container.WaitConditionNotRunning)
-	select {
-	case err = <-errC:
-		return
-	case result := <-resultC:
-		status = result.StatusCode
-	}
-	err = <-outputErr
-	return
+	go func(app *fiber.App) {
+		<-sig
+		os.Exit(0)
+	}(app)
+	defer app.Shutdown()
+
+	publicKeyOpts := ssh.PublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
+		data, _ := os.ReadFile("/Users/waleedalharthi/.ssh/id_rsa.pub")
+		allowed, _, _, _, _ := ssh.ParseAuthorizedKey(data)
+		return ssh.KeysEqual(key, allowed)
+	})
+
+	hostKeyFileOpts := ssh.HostKeyFile("/Users/waleedalharthi/.ssh/id_rsa")
+
+	log.Println("starting ssh server on port 2222...")
+	log.Fatal(ssh.ListenAndServe(":2222", nil, hostKeyFileOpts, publicKeyOpts))
 }
