@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -11,6 +12,10 @@ import (
 
 	"github.com/gliderlabs/ssh"
 	"github.com/gofiber/fiber/v2"
+)
+
+const (
+	MAX_FILE_SIZE = 1
 )
 
 var (
@@ -30,21 +35,40 @@ func init() {
 	rand.New(rand.NewSource(time.Now().UnixMicro()))
 }
 
+type fileWriter struct {
+	bytesWritten int
+}
+
+func (fw *fileWriter) Write(b []byte) (int, error) {
+	fw.bytesWritten = len(b)
+	if fw.bytesWritten > MAX_FILE_SIZE {
+		return 0, fmt.Errorf("max file size (%d) exceeded", MAX_FILE_SIZE)
+	}
+	return fw.bytesWritten, nil
+}
+
 func main() {
 	app := fiber.New(fiber.Config{
 		ReadTimeout: 5 * time.Second,
 	})
 	resp := new(bytes.Buffer)
+	fw := fileWriter{}
 	done := make(chan struct{})
 	sig := make(chan os.Signal)
 	uri := generateURI()
 	baseUrl := "http://localhost:3000"
 
 	ssh.Handle(func(sess ssh.Session) {
-		resp.ReadFrom(sess)
-		sess.Write([]byte(fmt.Sprintf("%x", "0x0C")))
-		url := fmt.Sprintf("%s/%s", baseUrl, uri)
-		sess.Write([]byte(url))
+		tee := io.TeeReader(sess, &fw)
+		_, err := resp.ReadFrom(tee)
+		if err != nil {
+			close(done)
+			sess.Write([]byte(fmt.Sprintf("error: %s", err)))
+		} else {
+			sess.Write([]byte("0x0C"))
+			url := fmt.Sprintf("%s/%s", baseUrl, uri)
+			sess.Write([]byte(url))
+		}
 		<-done
 		sess.Write([]byte("we are done"))
 		sig <- os.Kill
