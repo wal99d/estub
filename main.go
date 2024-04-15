@@ -56,7 +56,7 @@ func main() {
 	done := make(chan struct{})
 	sig := make(chan os.Signal)
 	uri := generateURI()
-	baseUrl := "http://localhost:3000"
+	baseUrl := fmt.Sprintf("%s:%s", os.Getenv("BASE_URL"), os.Getenv("PORT"))
 
 	ssh.Handle(func(sess ssh.Session) {
 		tee := io.TeeReader(sess, &fw)
